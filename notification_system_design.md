@@ -1,15 +1,19 @@
-﻿# Notification System Design
+# Notification System Design
 
 ## Stage 1
 
-### REST API Endpoints
+### REST API Contract
 
-#### 1. Get All Notifications
-- **Method:** GET
-- **Endpoint:** /api/notifications
-- **Headers:** Authorization: Bearer <token>
-- **Response:**
-`json
+#### Get Notifications
+
+```http
+GET /api/notifications?limit=10&page=1&notification_type=Placement
+Authorization: Bearer <token>
+```
+
+Response:
+
+```json
 {
   "notifications": [
     {
@@ -17,274 +21,220 @@
       "type": "Event|Result|Placement",
       "message": "string",
       "isRead": false,
-      "timestamp": "2024-01-01T00:00:00Z"
+      "timestamp": "2026-06-10T10:00:00Z"
     }
-  ]
+  ],
+  "total": 20,
+  "page": 1,
+  "limit": 10
 }
-`
+```
 
-#### 2. Mark Notification as Read
-- **Method:** PATCH
-- **Endpoint:** /api/notifications/:id/read
-- **Headers:** Authorization: Bearer <token>
-- **Response:**
-`json
+#### Mark Notification As Read
+
+```http
+PATCH /api/notifications/:id/read
+Authorization: Bearer <token>
+```
+
+Response:
+
+```json
 { "success": true, "message": "Notification marked as read" }
-`
+```
 
-#### 3. Get Unread Count
-- **Method:** GET
-- **Endpoint:** /api/notifications/unread-count
-- **Response:**
-`json
+#### Get Unread Count
+
+```http
+GET /api/notifications/unread-count
+Authorization: Bearer <token>
+```
+
+Response:
+
+```json
 { "unreadCount": 5 }
-`
+```
 
-### Real-time Notifications
-- Use **WebSockets** (Socket.io) for real-time delivery
-- Server emits event on new notification
-- Client listens and updates UI instantly
+### Real-Time Delivery
+
+Use WebSockets or Server-Sent Events for active sessions. The server emits newly created notifications, and the client inserts them into the current page without forcing a full reload.
 
 ## Stage 2
 
-### Database Choice: PostgreSQL
-PostgreSQL choose kiya kyunki:
-- ACID compliant - data integrity guaranteed
-- JSON support for flexible notification metadata
-- Better for complex queries and joins
-- Scales well with indexes
+### Database Choice
 
-### DB Schema
+PostgreSQL is the preferred primary store because notifications require reliable writes, filtered reads, ordering, indexing, and relational joins back to students. It also supports JSONB metadata if notification payloads become richer later.
 
-`sql
+### Schema
+
+```sql
 CREATE TABLE students (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  id BIGSERIAL PRIMARY KEY,
   name VARCHAR(255) NOT NULL,
   email VARCHAR(255) UNIQUE NOT NULL,
-  created_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE notifications (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  student_id UUID REFERENCES students(id),
-  type VARCHAR(50) CHECK (type IN ('Event', 'Result', 'Placement')),
+  student_id BIGINT NOT NULL REFERENCES students(id),
+  notification_type VARCHAR(20) NOT NULL
+    CHECK (notification_type IN ('Event', 'Result', 'Placement')),
   message TEXT NOT NULL,
-  is_read BOOLEAN DEFAULT false,
-  created_at TIMESTAMP DEFAULT NOW()
+  is_read BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-`
+```
 
-### REST API Queries
+### Core Queries
 
-`sql
--- Get all notifications for a student
-SELECT * FROM notifications 
-WHERE student_id =  
-ORDER BY created_at DESC;
+```sql
+SELECT id, notification_type, message, is_read, created_at
+FROM notifications
+WHERE student_id = $1
+ORDER BY created_at DESC
+LIMIT $2 OFFSET $3;
 
--- Mark as read
-UPDATE notifications 
-SET is_read = true 
-WHERE id = ;
+UPDATE notifications
+SET is_read = true
+WHERE id = $1 AND student_id = $2;
 
--- Get unread count
-SELECT COUNT(*) FROM notifications 
-WHERE student_id =  AND is_read = false;
-`
-
-### Scaling Problems & Solutions
-- **Problem:** As data grows, queries slow down
-- **Solution:** Add indexes on student_id and created_at
-- **Problem:** Too many connections
-- **Solution:** Use connection pooling (pg-pool)
-
-## Stage 2
-
-### Database Choice: PostgreSQL
-PostgreSQL choose kiya kyunki:
-- ACID compliant - data integrity guaranteed
-- JSON support for flexible notification metadata
-- Better for complex queries and joins
-- Scales well with indexes
-
-### DB Schema
-
-`sql
-CREATE TABLE students (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  name VARCHAR(255) NOT NULL,
-  email VARCHAR(255) UNIQUE NOT NULL,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE TABLE notifications (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  student_id UUID REFERENCES students(id),
-  type VARCHAR(50) CHECK (type IN ('Event', 'Result', 'Placement')),
-  message TEXT NOT NULL,
-  is_read BOOLEAN DEFAULT false,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-`
-
-### REST API Queries
-
-`sql
--- Get all notifications for a student
-SELECT * FROM notifications 
-WHERE student_id =  
-ORDER BY created_at DESC;
-
--- Mark as read
-UPDATE notifications 
-SET is_read = true 
-WHERE id = ;
-
--- Get unread count
-SELECT COUNT(*) FROM notifications 
-WHERE student_id =  AND is_read = false;
-`
-
-### Scaling Problems & Solutions
-- **Problem:** As data grows, queries slow down
-- **Solution:** Add indexes on student_id and created_at
-- **Problem:** Too many connections
-- **Solution:** Use connection pooling (pg-pool)
+SELECT COUNT(*)
+FROM notifications
+WHERE student_id = $1 AND is_read = false;
+```
 
 ## Stage 3
 
-### Slow Query Analysis
 Original query:
-SELECT * FROM notifications WHERE studentID = 1042 AND isRead = false ORDER BY createdAt ASC;
 
-**Why it is slow:**
-- No index on studentID, isRead, createdAt
-- SELECT * fetches all columns unnecessarily
-- 5 million rows = full table scan
+```sql
+SELECT *
+FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
 
-**Fix:**
-CREATE INDEX idx_notifications_student_read ON notifications(studentID, isRead, createdAt);
+The query is slow because it can scan a very large table, fetches all columns, and has no index that matches both the filter and the ordering.
 
-**Adding indexes on every column is BAD** because:
-- Slows down INSERT/UPDATE/DELETE
-- Wastes disk space
-- Only index columns used in WHERE/ORDER BY
+Recommended index:
 
-**Students with Placement notification in last 7 days:**
-SELECT DISTINCT studentID FROM notifications
+```sql
+CREATE INDEX idx_notifications_student_unread_created
+ON notifications (studentID, isRead, createdAt);
+```
+
+Adding indexes on every column is not effective. Each index adds storage cost and slows writes because every insert, update, and delete must maintain more index structures. Indexes should match real query patterns.
+
+Placement query:
+
+```sql
+SELECT DISTINCT studentID
+FROM notifications
 WHERE notification_type = 'Placement'
-AND createdAt >= NOW() - INTERVAL '7 days';
+  AND createdAt >= NOW() - INTERVAL '7 days';
+```
+
+Recommended supporting index:
+
+```sql
+CREATE INDEX idx_notifications_type_created_student
+ON notifications (notification_type, createdAt DESC, studentID);
+```
 
 ## Stage 4
 
-### Performance Solution: Caching with Redis
+Fetching notifications on every page load for every student will overload the database. The first improvement is a short-lived cache keyed by student and filter.
 
-**Problem:** DB hit on every page load for 50,000 students
+Strategy:
 
-**Solution:** Cache notifications in Redis with TTL
+- Cache the first page of notifications and unread count in Redis for 30 to 60 seconds.
+- Invalidate the student's cache when a new notification is created or a notification is marked as read.
+- Keep the database as the source of truth.
 
-**Strategy:**
-- On first load: fetch from DB, store in Redis with 60s TTL
-- On subsequent loads: serve from Redis cache
-- On new notification: invalidate cache for that student
+Tradeoffs:
 
-**Tradeoffs:**
-- Pro: Very fast reads, reduces DB load
-- Con: Slight staleness (up to 60s), extra infrastructure cost
-
-## Stage 5
-
-### Bulk Notification Problem
-
-**Shortcomings of original implementation:**
-- send_email is synchronous - if it fails at student 200, remaining 49800 dont get notified
-- No retry mechanism
-- Saving to DB and sending email in same flow - if DB fails, email already sent
-
-**Revised Approach: Queue-based system**
-
-Use a message queue (like Bull/Redis):
-1. Push all student_ids to queue
-2. Workers process each job independently
-3. Failed jobs are retried automatically
-4. DB save and email are separate jobs
-
-**Revised Pseudocode:**
-function notify_all(student_ids, message):
-  for student_id in student_ids:
-    queue.add('send_notification', { student_id, message })
-
-worker.process('send_notification', async (job):
-  save_to_db(job.student_id, job.message)
-  send_email(job.student_id, job.message)
-  push_to_app(job.student_id, job.message)
-)
-
-## Stage 3
-
-### Slow Query Analysis
-Original query:
-SELECT * FROM notifications WHERE studentID = 1042 AND isRead = false ORDER BY createdAt ASC;
-
-**Why it is slow:**
-- No index on studentID, isRead, createdAt
-- SELECT * fetches all columns unnecessarily
-- 5 million rows = full table scan
-
-**Fix:**
-CREATE INDEX idx_notifications_student_read ON notifications(studentID, isRead, createdAt);
-
-**Adding indexes on every column is BAD** because:
-- Slows down INSERT/UPDATE/DELETE
-- Wastes disk space
-- Only index columns used in WHERE/ORDER BY
-
-**Students with Placement notification in last 7 days:**
-SELECT DISTINCT studentID FROM notifications
-WHERE notification_type = 'Placement'
-AND createdAt >= NOW() - INTERVAL '7 days';
-
-## Stage 4
-
-### Performance Solution: Caching with Redis
-
-**Problem:** DB hit on every page load for 50,000 students
-
-**Solution:** Cache notifications in Redis with TTL
-
-**Strategy:**
-- On first load: fetch from DB, store in Redis with 60s TTL
-- On subsequent loads: serve from Redis cache
-- On new notification: invalidate cache for that student
-
-**Tradeoffs:**
-- Pro: Very fast reads, reduces DB load
-- Con: Slight staleness (up to 60s), extra infrastructure cost
+- Reads become much faster and database load drops.
+- Users can briefly see stale data if invalidation fails or the TTL has not expired.
+- Redis adds an operational dependency but is simpler and safer than pushing every page load to PostgreSQL.
 
 ## Stage 5
 
-### Bulk Notification Problem
+The original `notify_all` pseudocode is unreliable because email, database writes, and in-app pushes happen synchronously in one loop. If email fails at student 200, the remaining students may never receive the notification.
 
-**Shortcomings of original implementation:**
-- send_email is synchronous - if it fails at student 200, remaining 49800 dont get notified
-- No retry mechanism
-- Saving to DB and sending email in same flow - if DB fails, email already sent
+Revised approach:
 
-**Revised Approach: Queue-based system**
-
-Use a message queue (like Bull/Redis):
-1. Push all student_ids to queue
-2. Workers process each job independently
-3. Failed jobs are retried automatically
-4. DB save and email are separate jobs
-
-**Revised Pseudocode:**
+```text
 function notify_all(student_ids, message):
-  for student_id in student_ids:
-    queue.add('send_notification', { student_id, message })
+  notification_batch_id = save_batch(message)
 
-worker.process('send_notification', async (job):
-  save_to_db(job.student_id, job.message)
-  send_email(job.student_id, job.message)
-  push_to_app(job.student_id, job.message)
-)
+  for student_id in student_ids:
+    queue.enqueue("create_notification", {
+      notification_batch_id,
+      student_id,
+      message
+    })
+
+worker create_notification(job):
+  save_notification(job.student_id, job.message)
+  queue.enqueue("send_email", job)
+  queue.enqueue("push_in_app", job)
+
+worker send_email(job):
+  retry_with_backoff(() => send_email(job.student_id, job.message))
+
+worker push_in_app(job):
+  retry_with_backoff(() => push_to_app(job.student_id, job.message))
+```
+
+Saving to the database should happen independently from email delivery. Email should be retried with backoff and dead-letter handling, while the in-app notification can be available immediately.
+
+## Stage 6
+
+The Priority Inbox ranks notifications by:
+
+1. Type weight: `Placement = 3`, `Result = 2`, `Event = 1`
+2. Recency: newest notification first when two notifications have the same type weight
+
+Implemented approach:
+
+```js
+const PRIORITY_WEIGHT = { Placement: 3, Result: 2, Event: 1 };
+
+function prioritySort(a, b) {
+  const priorityDiff =
+    (PRIORITY_WEIGHT[b.Type] || 0) - (PRIORITY_WEIGHT[a.Type] || 0);
+
+  if (priorityDiff !== 0) {
+    return priorityDiff;
+  }
+
+  return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
+}
+```
+
+The backend exposes `GET /priority-notifications`, fetches the protected notification API, sorts the latest notification set with this comparator, and returns the top 10. To keep the top 10 efficient as new notifications arrive, the backend uses a short in-memory cache and the frontend refreshes periodically. In production, the same ranking can be maintained with a Redis sorted set or a database materialized view updated when notifications are created.
+
+## Stage 7
+
+The frontend runs on `http://localhost:3000` and uses the local backend proxy on port `5000` so credentials and token refresh logic are not placed in the browser bundle.
+
+Pages:
+
+- `/priority`: displays the top 10 priority notifications.
+- `/`: displays all notifications with type filters and pagination.
+
+Frontend behavior:
+
+- Distinguishes new and viewed notifications with local browser state.
+- Supports `All`, `Placement`, `Result`, and `Event` filters.
+- Refreshes notification data every 30 seconds.
+- Uses responsive CSS for desktop and mobile layouts.
+
+Backend behavior:
+
+- Authenticates against the evaluation service on demand instead of relying on an expiring hardcoded bearer token.
+- Proxies `GET /notifications` with `limit`, `page`, and `notification_type` support.
+- Proxies `GET /priority-notifications` for the Stage 6 priority inbox.
+- Uses the shared logging middleware for API activity and error paths.
